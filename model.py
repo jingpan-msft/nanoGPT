@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from added_modules import RotaryEmbedding, apply_rotary_emb
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -31,6 +33,10 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        # assert config.n_kv_head < 0 or config.head % config.n_kv_head == 0
+
+        # self.n_kv_head = config.n_kv_head
+
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
@@ -49,7 +55,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, pos_emb=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -58,6 +64,9 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
+        if pos_emb is not None:
+            q = apply_rotary_emb(q, pos_emb)
+            k = apply_rotary_emb(k, pos_emb)
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
@@ -100,8 +109,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, pos_emb=None):
+        x = x + self.attn(self.ln_1(x), pos_emb)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -114,6 +123,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    pe_embed_type: str = "absolute" # rotary or absolute
 
 class GPT(nn.Module):
 
@@ -123,9 +133,15 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        if config.pe_embed_type == "rotary":
+            pe = RotaryEmbedding(config.n_embd // config.n_head, config.block_size)
+        elif config.pe_embed_type == "absolute":
+            pe = nn.Embedding(config.block_size, config.n_embd)
+        else:
+            raise ValueError(f"Unknown positional embedding type: {config.pe_embed_type}")
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wpe = pe,
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -175,10 +191,15 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        if self.config.pe_embed_type == "absolute":
+            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+            x = self.transformer.drop(tok_emb + pos_emb)
+            pos_emb = None
+        else:
+            x = self.transformer.drop(tok_emb)
+            pos_emb = self.transformer.wpe(x) # position embeddings of shape (t, n_embd)
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, pos_emb)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
